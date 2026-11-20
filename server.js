@@ -1,14 +1,27 @@
-// server.js — Render等で動くNode.js版 中継(リバース)プロキシ
-// 要件: Node.js 20+ / package.json に "type": "module"
+// server.js — TikTok 中継(リバース)プロキシ（Render等 / Node.js 20+ / package.json に "type": "module"）
 //
-// 構成（通信を丸ごとProxy経由にする3層）
-//  1) サーバー側 : HTML/CSSのURLを全部書き換え（外部サイトは /~p/<scheme>/<host>/<path> 経由）
-//  2) ブラウザ側 : /~shim.js が fetch/XHR/WebSocket/動的要素/cookie などをProxy化
-//  3) ServiceWorker: /~sw.js がページから出る全リクエストを最終的にProxyへ回収
-// 従来どおり、TARGET のサイトは「ルート直下」でそのまま中継されます（互換維持）。
+// 構成（3層）
+//  1) サーバー : HTML/CSSのURLを書き換え。TARGET以外のホストは /~p/<scheme>/<host>/<path> 経由
+//  2) ブラウザ : /~shim.js が fetch/XHR/WebSocket/動的要素/cookie/履歴などをProxy化
+//  3) SW       : /~sw.js がページから出る全リクエストを最終的にProxyへ回収
+//
+// TARGET と完全一致するホストだけが「ルート直下で扱うサイト」。それ以外は必ず /~p/ 明示形式。
+//
+// 再生（オーバーレイ）
+//  - /video/ID や /@user/video/ID を開くと、プレイヤー位置に TikTok 公式埋め込み
+//    (/embed/v2/ID) を iframe で重ねて再生する。ネイティブ動画は一時停止する。
+//  - 閉じるボタンで消せる。フィードのスクロール等で別の動画に移ると、その動画を重ね直す。
+//
+// 検索
+//  - TikTok 本体の検索UI (/search?q=...) を中継する。検索APIの fetch/XHR も shim 経由で中継される。
+//
+// ルート直下パスの扱い
+//  - ルート直下パスは、Refererが「/~p/ 形式の外部ページ」ならそのサイトへ、それ以外は TARGET へ
+//  - /~p/ 経由のリダイレクト(Location)は常に /~p/ 形式で返す（ループ防止）
+//  - 自分自身へのリダイレクトを検出したらエラーにして止める
 //
 // 環境変数
-//  TARGET            中継の主対象（既定 https://www.b-ch.com）
+//  TARGET            中継の主対象（既定 https://www.tiktok.com/）
 //  PORT              Renderが自動で渡す
 //  ALLOW_EXTERNAL    0 にすると TARGET 以外のホストへの中継を禁止（既定は許可）
 //  RETRIES           GET/HEAD の再試行回数（既定 2）
@@ -22,7 +35,7 @@ import dns from "node:dns/promises";
 import crypto from "node:crypto";
 import { Readable, pipeline } from "node:stream";
 
-const TARGET = process.env.TARGET || "https://github.com/";
+const TARGET = process.env.TARGET || "https://www.tiktok.com/";
 const PORT = Number(process.env.PORT) || 10000;
 const ALLOW_EXTERNAL = process.env.ALLOW_EXTERNAL !== "0";
 const RETRIES = Number.isFinite(Number(process.env.RETRIES)) ? Number(process.env.RETRIES) : 2;
@@ -34,15 +47,13 @@ const DEFAULT_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
 
 const BASE = new URL(TARGET);
-const BARE = BASE.hostname.replace(/^www\./i, "");
-const SITE_HOSTS = [BARE, "www." + BARE];
-const isSiteHost = (h) => SITE_HOSTS.includes(String(h).toLowerCase());
+const SITE_HOST = BASE.hostname.toLowerCase(); // TARGET と完全一致するホストだけをルート直下で扱う
+const isSiteHost = (h) => String(h).toLowerCase() === SITE_HOST;
 const P = "/~p/"; // 外部サイト用: /~p/https/host/path
 const WS = "/~ws/"; // WebSocket用: /~ws/wss/host/path
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ───────────────────────── Cookie名の名前空間（サーバー/ブラウザ共通） ─────────────────────────
-// 1つのProxyドメインに複数サイトのcookieが混ざらないよう、サイトごとに接頭辞を付ける
 function ckey(h) {
   var p = String(h).toLowerCase().split(".");
   var n = 2;
@@ -52,11 +63,12 @@ function ckey(h) {
 const CK = (h) => "__px_" + ckey(h) + "__";
 
 // ───────────────────────── URL変換 ─────────────────────────
-function toProxy(href, myOrigin) {
+// explicitSite=true: 外部サイトのページ上などで、TARGET宛も /~p/ 形式で明示する
+function toProxy(href, myOrigin, explicitSite) {
   let u;
   try { u = new URL(href); } catch { return href; }
   if (u.protocol !== "http:" && u.protocol !== "https:") return href;
-  if (isSiteHost(u.hostname)) return myOrigin + u.pathname + u.search + u.hash;
+  if (isSiteHost(u.hostname) && !explicitSite) return myOrigin + u.pathname + u.search + u.hash;
   return myOrigin + P + u.protocol.slice(0, -1) + "/" + u.host + u.pathname + u.search + u.hash;
 }
 
@@ -81,18 +93,21 @@ function realFromProxyUrl(str, myOrigin) {
 
 // このリクエストが最終的に取りに行く上流URLを決める
 function resolveUpstream(req, url, myOrigin) {
+  // 1) /~p/https/host/path は明示的な外部サイト指定
   const p = parseProxyPath(url.pathname);
   if (p) return new URL(p.origin + p.path + url.search);
-  // /~p/ でないルート相対パス: Refererが外部サイトのProxyページならそのサイトへ、なければTARGETへ
+
+  // 2) ルート直下のパス
+  //    Refererが「/~p/ 形式の外部ページ」のときだけ、そのサイトの相対パスとして扱う。それ以外は TARGET
   let origin = BASE.origin;
-  if (req.headers.referer) {
-    try {
-      const r = new URL(req.headers.referer);
-      if (r.origin === myOrigin) {
-        const real = realFromProxyUrl(req.headers.referer, myOrigin);
-        if (real) origin = real.origin;
-      }
-    } catch {}
+  const referer = req.headers.referer;
+  if (referer) {
+    let refUrl = null;
+    try { refUrl = new URL(referer); } catch {}
+    if (refUrl && refUrl.origin === myOrigin && refUrl.pathname.startsWith(P)) {
+      const real = realFromProxyUrl(referer, myOrigin);
+      if (real) origin = real.origin;
+    }
   }
   return new URL(origin + url.pathname + url.search);
 }
@@ -138,7 +153,10 @@ function rewriteUrl(v, base, my) {
   const s = v.trim();
   if (!s || SKIP_RE.test(s) || s.startsWith(my + P)) return v;
   try {
-    return toProxy(new URL(s, base).href, my).replace(/"/g, "%22").replace(/'/g, "%27");
+    // 今いるページが外部サイトなら、TARGET へのリンクも /~p/ 形式で明示する
+    let ext = false;
+    try { ext = !isSiteHost(new URL(base).hostname); } catch {}
+    return toProxy(new URL(s, base).href, my, ext).replace(/"/g, "%22").replace(/'/g, "%27");
   } catch {
     return v;
   }
@@ -220,7 +238,7 @@ function rewriteHtml(html, upstream, my) {
   return out;
 }
 
-// 文字コード（Shift_JIS / EUC-JP 等）を判定してUTF-8に統一
+// 文字コードを判定してUTF-8に統一
 function charsetOf(type, buf) {
   let m = /charset\s*=\s*["']?([\w.:-]+)/i.exec(type || "");
   if (!m) {
@@ -280,7 +298,6 @@ function buildUpstreamHeaders(req, upstream, myOrigin) {
   return h;
 }
 
-// ★修正1: DROP_RES から "location" を削除
 const DROP_RES = new Set(["content-security-policy", "content-security-policy-report-only", "x-frame-options", "strict-transport-security", "public-key-pins", "report-to", "nel", "cross-origin-embedder-policy", "cross-origin-opener-policy", "cross-origin-resource-policy", "permissions-policy", "alt-svc", "link", "set-cookie", "content-encoding", "content-length", "transfer-encoding", "connection", "keep-alive", "refresh", "content-location", "clear-site-data"]);
 
 function corsHeaders(req) {
@@ -292,28 +309,35 @@ function corsHeaders(req) {
     "access-control-allow-headers": req.headers["access-control-request-headers"] || "*",
     "access-control-expose-headers": "*",
     "access-control-max-age": "86400",
-    vary: "Origin",
   };
 }
 
-// ★修正2: GitHub等（PJAX/Turbo）が返す特殊ヘッダやLocationをプロキシ用に書き換える
+// Location / PJAX系ヘッダをプロキシ用に書き換える
 function responseHeaders(r, req, upstream, myOrigin) {
   const h = {};
+  // 外部サイトのレスポンス、または /~p/ 明示形式で来たリクエストは、Locationも /~p/ 形式で返す
+  let viaExplicit = false;
+  try { viaExplicit = !!parseProxyPath(new URL("http://local" + req.url).pathname); } catch {}
+  const ext = !isSiteHost(upstream.hostname) || viaExplicit;
   for (const [k, v] of r.headers) {
     if (DROP_RES.has(k) || k.startsWith("access-control-")) continue;
-    
+
     if (k === "location" || k === "x-pjax-url" || k === "turbo-location") {
       try {
-        h[k] = toProxy(new URL(v, upstream).href, myOrigin);
+        h[k] = toProxy(new URL(v, upstream).href, myOrigin, ext);
       } catch {
         h[k] = v;
       }
       continue;
     }
-    
+
     h[k] = v;
   }
+  // CORSヘッダで上流の vary を消さないようにマージする
+  const upVary = h.vary;
   Object.assign(h, corsHeaders(req));
+  h.vary = upVary ? `${upVary}, Origin` : "Origin";
+
   const sc = typeof r.headers.getSetCookie === "function" ? r.headers.getSetCookie() : [];
   const cookies = sc.map((c) => rewriteSetCookie(c, upstream.hostname, myOrigin.startsWith("https"))).filter(Boolean);
   if (cookies.length) h["set-cookie"] = cookies;
@@ -412,6 +436,7 @@ async function handle(req, res) {
   }
 
   const upstream = resolveUpstream(req, url, myOrigin);
+
   if (upstream.hostname.toLowerCase() === host.replace(/:\d+$/, "").toLowerCase() && !isSiteHost(upstream.hostname))
     throw httpErr(508, "Loop detected");
   await assertPublic(upstream.hostname);
@@ -428,9 +453,16 @@ async function handle(req, res) {
   const status = r.status;
   const hdrs = responseHeaders(r, req, upstream, myOrigin);
 
-  // ★修正3: リダイレクト処理の簡略化
+  // リダイレクト（自分自身へのリダイレクトは止める）
   if (hdrs["location"] && status >= 300 && status < 400) {
     r.body?.cancel().catch(() => {});
+    let selfLoop = false;
+    try {
+      const self = new URL(req.url, myOrigin).href;
+      const dest = new URL(hdrs["location"], myOrigin).href;
+      selfLoop = self === dest;
+    } catch {}
+    if (selfLoop) throw httpErr(508, "Redirect loop detected");
     hdrs["cache-control"] = "no-store";
     res.writeHead(status, hdrs);
     return res.end();
@@ -525,9 +557,9 @@ function makeShim() {
   return String.raw`(function(){
 "use strict";
 if(window.__pxShim)return;window.__pxShim=1;
-var O=location.origin,P=${JSON.stringify(P)},WSP=${JSON.stringify(WS)},T=${JSON.stringify(BASE.origin)},HOSTS=${JSON.stringify(SITE_HOSTS)};
+var O=location.origin,P=${JSON.stringify(P)},WSP=${JSON.stringify(WS)},T=${JSON.stringify(BASE.origin)},SITE=${JSON.stringify(SITE_HOST)};
 var ckey=${ckey.toString()};
-function isSite(h){return HOSTS.indexOf(String(h).toLowerCase())>=0}
+function isSite(h){return String(h).toLowerCase()===SITE}
 function parseP(pn){
   if(pn.indexOf(P)!==0)return null;
   var m=/^(https?)\/([^\/]+)(\/.*)?$/.exec(pn.slice(P.length));
@@ -548,11 +580,13 @@ function prox(h){
     var u=new URL(t,location.href);
     if(u.protocol!=="http:"&&u.protocol!=="https:")return h;
     if(u.origin===O){
-      if(u.pathname.indexOf(P)===0||u.pathname.indexOf("/~")===0)return u.href;
+      if(u.pathname.indexOf(P)===0)return u.href;
+      if(u.pathname.indexOf("/~")===0)return u.href;
       var rb=realBase();
       u=new URL(rb.origin+u.pathname+u.search+u.hash);
     }
-    if(isSite(u.hostname))return O+u.pathname+u.search+u.hash;
+    // TARGET宛でも、今いるページが外部サイトなら /~p/ 形式で明示
+    if(isSite(u.hostname)&&isSite(realBase().hostname))return O+u.pathname+u.search+u.hash;
     return O+P+u.protocol.slice(0,-1)+"/"+u.host+u.pathname+u.search+u.hash;
   }catch(e){return h}
 }
@@ -632,7 +666,7 @@ function fixForm(f){
 document.addEventListener("submit",function(e){if(e.target)fixForm(e.target)},true);
 try{var fs=HTMLFormElement.prototype.submit;HTMLFormElement.prototype.submit=function(){fixForm(this);return fs.call(this)}}catch(e){}
 ["pushState","replaceState"].forEach(function(m){
-  var o=history[m];history[m]=function(s,t,u){try{if(u!=null)u=prox(u)}catch(e){}return o.call(this,s,t,u)};
+  var o=history[m];history[m]=function(s,t,u){try{if(u!=null)u=prox(u)}catch(e){}var r=o.call(this,s,t,u);try{setTimeout(ttSync,0)}catch(e){}return r};
 });
 try{var wo=window.open;window.open=function(u){var a=[].slice.call(arguments);if(u!=null&&u!=="")a[0]=prox(u);return wo.apply(this,a)}}catch(e){}
 try{
@@ -647,6 +681,75 @@ try{
     });
   }
 }catch(e){}
+
+// ── 再生オーバーレイ（TikTok の /video/ID, /@user/video/ID）
+// 動画ページを開くと、プレイヤーの位置に /embed/v2/ID（中継経由）を iframe で重ねて再生する
+var TTH=/(^|\.)tiktok\.com$/i;
+function ttId(ru){
+  try{
+    if(!TTH.test(ru.hostname))return null;
+    var m=/^\/(?:@[^\/]+\/)?video\/(\d{6,})/.exec(ru.pathname);
+    return m?m[1]:null;
+  }catch(e){return null}
+}
+var ttOv=null,ttTimer=0,ttDismissed="";
+var TT_SEL=['div[data-e2e="browse-video"]','div[data-e2e="video-player"]','div[class*="DivVideoContainer"]','div[class*="DivPlayerContainer"]','video'];
+function ttRect(){
+  for(var i=0;i<TT_SEL.length;i++){
+    var el=document.querySelector(TT_SEL[i]);
+    if(el){var b=el.getBoundingClientRect();if(b.width>80&&b.height>80)return b}
+  }
+  return null;
+}
+function ttPauseNative(){
+  try{var vs=document.querySelectorAll("video");for(var i=0;i<vs.length;i++){if(!vs[i].paused)vs[i].pause()}}catch(e){}
+}
+function ttPos(){
+  if(!ttOv)return;
+  var r=ttRect(),s=ttOv.style,W=window.innerWidth,H=window.innerHeight;
+  if(r){s.left=r.left+"px";s.top=r.top+"px";s.width=r.width+"px";s.height=r.height+"px"}
+  else{s.left="0px";s.top="0px";s.width=W+"px";s.height=H+"px"}
+}
+function ttUnmount(){
+  if(ttTimer){clearInterval(ttTimer);ttTimer=0}
+  if(ttOv){try{ttOv.parentNode&&ttOv.parentNode.removeChild(ttOv)}catch(e){}ttOv=null}
+}
+function ttMount(id){
+  var box=document.createElement("div");
+  box.setAttribute("data-id",id);
+  box.style.cssText="position:fixed;z-index:2147483600;background:#000;overflow:hidden;margin:0;padding:0";
+  var f=document.createElement("iframe");
+  f.src=O+"/embed/v2/"+encodeURIComponent(id);
+  f.setAttribute("allow","autoplay; fullscreen; encrypted-media; picture-in-picture; clipboard-write");
+  f.setAttribute("allowfullscreen","");
+  f.style.cssText="position:absolute;left:0;top:0;width:100%;height:100%;border:0;margin:0";
+  box.appendChild(f);
+  var x=document.createElement("button");
+  x.type="button";
+  x.textContent="×";
+  x.setAttribute("aria-label","閉じる");
+  x.style.cssText="position:absolute;top:6px;right:6px;z-index:2;width:32px;height:32px;border:0;border-radius:16px;background:rgba(0,0,0,.6);color:#fff;font-size:20px;line-height:32px;padding:0;cursor:pointer";
+  x.onclick=function(e){e.preventDefault();e.stopPropagation();ttDismissed=id;ttUnmount()};
+  box.appendChild(x);
+  document.documentElement.appendChild(box);
+  ttOv=box;
+  ttPos();
+  ttPauseNative();
+  ttTimer=setInterval(function(){ttPos();ttPauseNative()},500);
+}
+function ttSync(){
+  try{
+    var id=ttId(realBase());
+    if(!id){ttDismissed="";ttUnmount();return}
+    if(id===ttDismissed){ttUnmount();return}
+    if(ttOv&&ttOv.getAttribute("data-id")===id){ttPos();return}
+    ttUnmount();
+    ttMount(id);
+  }catch(e){}
+}
+window.addEventListener("popstate",function(){setTimeout(ttSync,0)});
+setInterval(ttSync,800);
+if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",ttSync);else ttSync();
 
 // ── ServiceWorker: 自分のSWを登録し、サイト側のSW登録は無効化
 try{
@@ -663,15 +766,15 @@ try{
 // ───────────────────────── ServiceWorker（最終的に全通信を回収） ─────────────────────────
 function makeSw() {
   return String.raw`"use strict";
-const P=${JSON.stringify(P)},HOSTS=${JSON.stringify(SITE_HOSTS)};
+const P=${JSON.stringify(P)},SITE=${JSON.stringify(SITE_HOST)};
 const O=self.location.origin;
-const isSite=(h)=>HOSTS.includes(String(h).toLowerCase());
+const isSite=(h)=>String(h).toLowerCase()===SITE;
 self.addEventListener("install",()=>self.skipWaiting());
 self.addEventListener("activate",(e)=>e.waitUntil(self.clients.claim()));
 
+// 別オリジン宛はすべて /~p/ 形式で明示
 function toProxy(u){
   if(u.protocol!=="http:"&&u.protocol!=="https:")return null;
-  if(isSite(u.hostname))return O+u.pathname+u.search;
   return O+P+u.protocol.slice(0,-1)+"/"+u.host+u.pathname+u.search;
 }
 async function clientReal(id){
@@ -694,6 +797,7 @@ async function handle(e,req,u){
   try{
     let target=null;
     if(u.origin===O){
+      // 外部サイトのページ（/~p/形式）から出るルート直下リクエストは、そのサイト宛にする
       const c=await clientReal(e.clientId||e.resultingClientId);
       if(c&&!isSite(c.host.replace(/:\d+$/,"")))target=O+P+c.scheme+"/"+c.host+u.pathname+u.search;
     }else{
