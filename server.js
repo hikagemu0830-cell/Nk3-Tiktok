@@ -9,10 +9,10 @@
 //  - 上流へは Accept-Language: ja-JP を送る
 //  - ブラウザ側は navigator.language / languages を ja-JP に固定し、<html lang="ja"> にする
 //
-// 日本の動画だけ流す（できる範囲）
+// 日本の動画だけ流す（FEED_FILTER=0 で止められる）
 //  - おすすめ一覧 (/api/recommend/item_list 等) のJSONを、日本語の説明文 or 地域JP のものだけに絞る
-//  - 1件も残らない場合は元の一覧をそのまま返す（読み込みが止まらないように）
-//  - 注意: TikTok の地域判定はサーバーのIPにも依存するため、完全に日本の動画だけになる保証はない
+//  - 1件も残らない場合は元の一覧をそのまま返す
+//  - TikTok の地域判定はサーバーのIPにも依存するため、完全に日本の動画だけになる保証はない
 //
 // 速度
 //  - 静的ファイル(JS/CSS/画像/フォント)はメモリにキャッシュし、2回目以降は上流に行かない
@@ -21,8 +21,10 @@
 //  - 埋め込みプレイヤー(/embed/v2/)はブラウザが TikTok に直接つなぐ（中継しない）
 //
 // 再生（オーバーレイ）
-//  - /video/ID や /@user/video/ID を開くと、プレイヤー位置に TikTok 公式の埋め込みを iframe で重ねる
-//  - ネイティブ動画は一時停止する。閉じるボタンで消せる。別の動画に移ると重ね直す
+//  - 検索・プロフィール・直接開いた /video/ID など「非フィード」から開いた動画だけ、
+//    動画の映像部分に公式埋め込みを重ねる。映像の外側（ボタン・スクロール）は操作できる
+//  - 映像の上をクリックすると埋め込みを操作できる。マウスが離れる/映像の外をタップするとスクロールに戻る
+//  - フィード（おすすめ・フォロー等）でスクロールして変わった動画には重ねない（ネイティブのまま）
 //
 // 検索
 //  - TikTok 本体の検索UI (/search?q=...) を中継する。検索APIの fetch/XHR も shim 経由
@@ -36,6 +38,7 @@
 //  TARGET            中継の主対象（既定 https://www.tiktok.com/）
 //  PORT              Renderが自動で渡す
 //  ALLOW_EXTERNAL    0 にすると TARGET 以外のホストへの中継を禁止（既定は許可）
+//  FEED_FILTER       0 にすると日本語の絞り込みを止める（既定は有効）
 //  RETRIES           GET/HEAD の再試行回数（既定 2）
 //  HEADER_TIMEOUT_MS 上流のヘッダ待ち上限（既定 25000）
 //  BODY_TIMEOUT_MS   HTML/CSS/静的ファイル本文の受信上限（既定 60000）
@@ -52,6 +55,7 @@ import { Readable, pipeline } from "node:stream";
 const TARGET = process.env.TARGET || "https://www.tiktok.com/";
 const PORT = Number(process.env.PORT) || 10000;
 const ALLOW_EXTERNAL = process.env.ALLOW_EXTERNAL !== "0";
+const FEED_FILTER = process.env.FEED_FILTER !== "0";
 const RETRIES = Number.isFinite(Number(process.env.RETRIES)) ? Number(process.env.RETRIES) : 2;
 const HEADER_TIMEOUT = Number(process.env.HEADER_TIMEOUT_MS) || 25000;
 const BODY_TIMEOUT = Number(process.env.BODY_TIMEOUT_MS) || 60000;
@@ -152,8 +156,9 @@ function isJapaneseItem(it) {
   return JP_TEXT_RE.test(String(it.desc || ""));
 }
 
-// 日本の動画が1件もなければ null を返し、呼び出し側は元のJSONをそのまま使う（読み込みが止まらないように）
+// 日本の動画が1件もなければ null を返し、呼び出し側は元のJSONをそのまま使う
 function filterFeedJson(text) {
+  if (!FEED_FILTER) return null;
   let json;
   try { json = JSON.parse(text); } catch { return null; }
   if (!json || typeof json !== "object") return null;
@@ -635,7 +640,7 @@ async function handle(req, res) {
     return sendBuffer(req, res, status, hdrs, out);
   }
 
-  // おすすめ一覧のJSON：日本の動画だけに絞る
+  // おすすめ一覧のJSON：日本の動画に絞る（FEED_FILTER=0 なら絞らない）
   if (isJson && status === 200 && req.method === "GET" && FEED_PATH_RE.test(upstream.pathname)) {
     const buf = await readAll(r, ac);
     const filtered = filterFeedJson(buf.toString("utf8"));
@@ -843,9 +848,14 @@ try{
 }catch(e){}
 
 // ── 再生オーバーレイ（TikTok の /video/ID, /@user/video/ID）
-// プレイヤーの位置に TikTok 公式の埋め込みを iframe で重ねる（埋め込みは直接読む）
-var ttOv=null,ttDismissed="",ttTimer=0,ttQueued=false;
+// ・検索・プロフィール・直接開いた動画ページなど「非フィード」から開いた動画だけ、
+//   動画の映像部分に公式埋め込みを重ねる。映像の外側（ボタン・スクロール）は操作できる
+// ・映像の上をクリックすると埋め込みを操作できる。マウスが離れる／映像の外をタップするとスクロールに戻る
+// ・フィード（おすすめ・フォロー等）でスクロールして変わった動画には重ねない（ネイティブのまま）
 var TTID=/^\/(?:@[^\/]+\/)?video\/(\d{6,})/;
+var FEED_RE=/^\/(foryou|following|friends|explore)?\/?$/;
+var ttOv=null,ttFrame=null,ttShield=null,ttActive=false;
+var ttCurId=null,ttLastPath="",ttFeedNav=false,ttDismissed="";
 function ttId(ru){
   try{
     if(!TTH.test(ru.hostname))return null;
@@ -853,72 +863,91 @@ function ttId(ru){
     return m?m[1]:null;
   }catch(e){return null}
 }
-var TT_SEL=['div[data-e2e="browse-video"]','div[data-e2e="video-player"]','div[class*="DivVideoContainer"]','div[class*="DivPlayerContainer"]','video'];
-function ttRect(){
-  for(var i=0;i<TT_SEL.length;i++){
-    var el=document.querySelector(TT_SEL[i]);
-    if(el){var b=el.getBoundingClientRect();if(b.width>80&&b.height>80)return b}
+// 映像（video要素）のうち一番大きいものの位置。見つからなければ null（全画面には広げない）
+function ttVideoRect(){
+  var best=null,area=0,vs=document.querySelectorAll("video");
+  for(var i=0;i<vs.length;i++){
+    var b=vs[i].getBoundingClientRect(),a=b.width*b.height;
+    if(b.width>120&&b.height>120&&a>area){area=a;best=b}
   }
-  return null;
+  return best;
 }
 function ttPauseNative(){
   try{var vs=document.querySelectorAll("video");for(var i=0;i<vs.length;i++){if(!vs[i].paused)vs[i].pause()}}catch(e){}
 }
 function ttPos(){
   if(!ttOv)return;
-  var r=ttRect(),s=ttOv.style,W=window.innerWidth,H=window.innerHeight;
-  if(r){s.left=r.left+"px";s.top=r.top+"px";s.width=r.width+"px";s.height=r.height+"px"}
-  else{s.left="0px";s.top="0px";s.width=W+"px";s.height=H+"px"}
+  var r=ttVideoRect();
+  if(!r){ttUnmount();return}
+  var s=ttOv.style;
+  s.left=r.left+"px";s.top=r.top+"px";s.width=r.width+"px";s.height=r.height+"px";
 }
-function ttPosSoon(){
-  if(ttQueued)return;
-  ttQueued=true;
-  requestAnimationFrame(function(){ttQueued=false;ttPos()});
+// 埋め込みの操作の有効/無効（無効のときはスクロールやボタンがそのまま効く）
+function ttSetActive(on){
+  if(!ttFrame||!ttShield)return;
+  ttActive=!!on;
+  ttFrame.style.pointerEvents=ttActive?"auto":"none";
+  ttShield.style.display=ttActive?"none":"block";
 }
-// オーバーレイ中は、ネイティブ動画が再生を始めたら止める
-document.addEventListener("play",function(e){
-  try{if(ttOv&&e.target&&e.target.tagName==="VIDEO")e.target.pause()}catch(x){}
-},true);
-window.addEventListener("resize",ttPosSoon,{passive:true});
-window.addEventListener("scroll",ttPosSoon,{passive:true,capture:true});
 function ttUnmount(){
-  if(ttTimer){clearInterval(ttTimer);ttTimer=0}
-  if(ttOv){try{ttOv.parentNode&&ttOv.parentNode.removeChild(ttOv)}catch(e){}ttOv=null}
+  if(ttOv){try{ttOv.parentNode&&ttOv.parentNode.removeChild(ttOv)}catch(e){}}
+  ttOv=null;ttFrame=null;ttShield=null;ttActive=false;
 }
 function ttMount(id){
   var box=document.createElement("div");
   box.setAttribute("data-id",id);
-  box.style.cssText="position:fixed;z-index:2147483600;background:#000;overflow:hidden;margin:0;padding:0";
+  box.style.cssText="position:fixed;z-index:2147483000;background:#000;overflow:hidden;margin:0;padding:0;pointer-events:none";
   var f=document.createElement("iframe");
   f.setAttribute("allow","autoplay; fullscreen; encrypted-media; picture-in-picture; clipboard-write");
   f.setAttribute("allowfullscreen","");
-  f.style.cssText="position:absolute;left:0;top:0;width:100%;height:100%;border:0;margin:0";
+  f.style.cssText="position:absolute;left:0;top:0;width:100%;height:100%;border:0;margin:0;pointer-events:none";
   f.src="https://www.tiktok.com/embed/v2/"+encodeURIComponent(id);
   box.appendChild(f);
+  var sh=document.createElement("div");
+  sh.title="クリックで操作";
+  sh.style.cssText="position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:auto;cursor:pointer;background:transparent";
+  sh.onclick=function(e){e.preventDefault();e.stopPropagation();ttSetActive(true)};
+  box.appendChild(sh);
   var x=document.createElement("button");
   x.type="button";
   x.textContent="×";
   x.setAttribute("aria-label","閉じる");
-  x.style.cssText="position:absolute;top:6px;right:6px;z-index:2;width:32px;height:32px;border:0;border-radius:16px;background:rgba(0,0,0,.6);color:#fff;font-size:20px;line-height:32px;padding:0;cursor:pointer";
+  x.style.cssText="position:absolute;top:6px;right:6px;z-index:2;width:32px;height:32px;border:0;border-radius:16px;background:rgba(0,0,0,.6);color:#fff;font-size:20px;line-height:32px;padding:0;cursor:pointer;pointer-events:auto";
   x.onclick=function(e){e.preventDefault();e.stopPropagation();ttDismissed=id;ttUnmount()};
   box.appendChild(x);
   document.documentElement.appendChild(box);
-  ttOv=box;
+  ttOv=box;ttFrame=f;ttShield=sh;ttActive=false;
+  f.addEventListener("mouseleave",function(){ttSetActive(false)});
   ttPos();
   ttPauseNative();
 }
 function ttSync(){
   try{
-    var id=ttId(realBase());
-    if(!id){ttDismissed="";ttUnmount();return}
-    if(id===ttDismissed){ttUnmount();return}
-    if(ttOv&&ttOv.getAttribute("data-id")===id){ttPos();ttPauseNative();return}
-    ttUnmount();
-    ttMount(id);
+    var ru=realBase(),id=ttId(ru),path=ru.pathname;
+    if(id!==ttCurId){
+      // 動画IDが変わった。直前が動画ページ、またはフィード画面なら「スクロールで次の動画」とみなす
+      ttFeedNav=(ttCurId!==null)||FEED_RE.test(ttLastPath);
+      ttCurId=id;
+      ttUnmount();
+    }
+    ttLastPath=path;
+    if(!id){ttDismissed="";return}
+    if(ttFeedNav||ttDismissed===id)return;
+    if(ttOv){ttPos();if(!ttActive)ttPauseNative()}
+    else if(ttVideoRect())ttMount(id);
   }catch(e){}
 }
+// オーバーレイ表示中は、ネイティブ動画が再生を始めたら止める
+document.addEventListener("play",function(e){
+  try{if(ttOv&&e.target&&e.target.tagName==="VIDEO")e.target.pause()}catch(x){}
+},true);
+// 埋め込みの外（映像の外）をタップしたら、埋め込みの操作を終える（タッチ端末用）
+document.addEventListener("pointerdown",function(e){
+  try{if(ttActive&&ttOv&&!ttOv.contains(e.target))ttSetActive(false)}catch(x){}
+},true);
+window.addEventListener("resize",function(){ttSync()});
 window.addEventListener("popstate",function(){setTimeout(ttSync,0)});
-ttTimer=setInterval(ttSync,1000);
+setInterval(ttSync,800);
 if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",ttSync);else ttSync();
 
 // ── ServiceWorker: 自分のSWを登録し、サイト側のSW登録は無効化
