@@ -1,19 +1,31 @@
-// server.js — TikTok 中継(リバース)プロキシ（Render等 / Node.js 20+ / package.json に "type": "module"）
+// server.js — TikTok 中継(リバース)プロキシ（Render / Node.js 20+ / package.json に "type": "module"）
 //
 // 構成（3層）
 //  1) サーバー : HTML/CSSのURLを書き換え。TARGET以外のホストは /~p/<scheme>/<host>/<path> 経由
 //  2) ブラウザ : /~shim.js が fetch/XHR/WebSocket/動的要素/cookie/履歴などをProxy化
 //  3) SW       : /~sw.js がページから出る全リクエストを最終的にProxyへ回収
 //
-// TARGET と完全一致するホストだけが「ルート直下で扱うサイト」。それ以外は必ず /~p/ 明示形式。
+// 言語
+//  - 上流へは Accept-Language: ja-JP を送る
+//  - ブラウザ側は navigator.language / languages を ja-JP に固定し、<html lang="ja"> にする
+//
+// 日本の動画だけ流す（できる範囲）
+//  - おすすめ一覧 (/api/recommend/item_list 等) のJSONを、日本語の説明文 or 地域JP のものだけに絞る
+//  - 1件も残らない場合は元の一覧をそのまま返す（読み込みが止まらないように）
+//  - 注意: TikTok の地域判定はサーバーのIPにも依存するため、完全に日本の動画だけになる保証はない
+//
+// 速度
+//  - 静的ファイル(JS/CSS/画像/フォント)はメモリにキャッシュし、2回目以降は上流に行かない
+//  - HTML/CSS/JS/JSON は gzip で圧縮して返す
+//  - 計測・ログ系の通信は上流に送らず 204 で返す
+//  - 埋め込みプレイヤー(/embed/v2/)はブラウザが TikTok に直接つなぐ（中継しない）
 //
 // 再生（オーバーレイ）
-//  - /video/ID や /@user/video/ID を開くと、プレイヤー位置に TikTok 公式埋め込み
-//    (/embed/v2/ID) を iframe で重ねて再生する。ネイティブ動画は一時停止する。
-//  - 閉じるボタンで消せる。フィードのスクロール等で別の動画に移ると、その動画を重ね直す。
+//  - /video/ID や /@user/video/ID を開くと、プレイヤー位置に TikTok 公式の埋め込みを iframe で重ねる
+//  - ネイティブ動画は一時停止する。閉じるボタンで消せる。別の動画に移ると重ね直す
 //
 // 検索
-//  - TikTok 本体の検索UI (/search?q=...) を中継する。検索APIの fetch/XHR も shim 経由で中継される。
+//  - TikTok 本体の検索UI (/search?q=...) を中継する。検索APIの fetch/XHR も shim 経由
 //
 // ルート直下パスの扱い
 //  - ルート直下パスは、Refererが「/~p/ 形式の外部ページ」ならそのサイトへ、それ以外は TARGET へ
@@ -26,13 +38,15 @@
 //  ALLOW_EXTERNAL    0 にすると TARGET 以外のホストへの中継を禁止（既定は許可）
 //  RETRIES           GET/HEAD の再試行回数（既定 2）
 //  HEADER_TIMEOUT_MS 上流のヘッダ待ち上限（既定 25000）
-//  BODY_TIMEOUT_MS   HTML/CSS本文の受信上限（既定 60000）
+//  BODY_TIMEOUT_MS   HTML/CSS/静的ファイル本文の受信上限（既定 60000）
 
 import http from "node:http";
 import net from "node:net";
 import tls from "node:tls";
 import dns from "node:dns/promises";
 import crypto from "node:crypto";
+import zlib from "node:zlib";
+import { promisify } from "node:util";
 import { Readable, pipeline } from "node:stream";
 
 const TARGET = process.env.TARGET || "https://www.tiktok.com/";
@@ -46,12 +60,22 @@ const MAX_BODY_BYTES = 100 * 1024 * 1024;
 const DEFAULT_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
 
+// 言語は常に日本語
+const LANG = "ja-JP";
+const ACCEPT_LANG = "ja-JP,ja;q=0.9";
+
+// 静的ファイルのメモリキャッシュ
+const ASSET_MAX_BYTES = 150 * 1024 * 1024; // 合計上限
+const ASSET_ITEM_MAX = 4 * 1024 * 1024; // 1件の上限
+const ASSET_TTL = 60 * 60 * 1000; // 1時間
+
 const BASE = new URL(TARGET);
 const SITE_HOST = BASE.hostname.toLowerCase(); // TARGET と完全一致するホストだけをルート直下で扱う
 const isSiteHost = (h) => String(h).toLowerCase() === SITE_HOST;
 const P = "/~p/"; // 外部サイト用: /~p/https/host/path
 const WS = "/~ws/"; // WebSocket用: /~ws/wss/host/path
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const gzipAsync = promisify(zlib.gzip);
 
 // ───────────────────────── Cookie名の名前空間（サーバー/ブラウザ共通） ─────────────────────────
 function ckey(h) {
@@ -110,6 +134,66 @@ function resolveUpstream(req, url, myOrigin) {
     }
   }
   return new URL(origin + url.pathname + url.search);
+}
+
+// ───────────────────────── 計測・ログ系の通信（上流に送らず 204） ─────────────────────────
+const TRACK_HOST_RE = /^(log|mon|monitor|analytics|pixel|collect|metrics|ads)\./i;
+const TRACK_PATH_RE = /\/(log|logs|monitor|collect|pixel|track|tracking)(\/|$)/i;
+const isTracker = (u) => TRACK_HOST_RE.test(u.hostname) || TRACK_PATH_RE.test(u.pathname);
+
+// ───────────────────────── 日本の動画だけ残す（おすすめ一覧のJSON） ─────────────────────────
+const FEED_PATH_RE = /^\/api\/(recommend|related)\/item_list\/?$/;
+const JP_TEXT_RE = /[\u3040-\u30ff\u3400-\u9fff\uff66-\uff9f]/; // ひらがな・カタカナ・漢字・半角カナ
+
+function isJapaneseItem(it) {
+  if (!it || typeof it !== "object") return false;
+  if (it.region === "JP" || (it.author && it.author.region === "JP")) return true;
+  if (typeof it.desc_language === "string" && /^ja/i.test(it.desc_language)) return true;
+  return JP_TEXT_RE.test(String(it.desc || ""));
+}
+
+// 日本の動画が1件もなければ null を返し、呼び出し側は元のJSONをそのまま使う（読み込みが止まらないように）
+function filterFeedJson(text) {
+  let json;
+  try { json = JSON.parse(text); } catch { return null; }
+  if (!json || typeof json !== "object") return null;
+  const key = Array.isArray(json.itemList) ? "itemList" : Array.isArray(json.items) ? "items" : null;
+  if (!key) return null;
+  const jp = json[key].filter(isJapaneseItem);
+  if (jp.length === 0) return null;
+  json[key] = jp;
+  return Buffer.from(JSON.stringify(json), "utf8");
+}
+
+// ───────────────────────── 静的ファイルのメモリキャッシュ ─────────────────────────
+const STATIC_RE = /^(text\/css|application\/javascript|text\/javascript|image\/|font\/|application\/font|application\/x-font|application\/wasm)/i;
+const ASSET_CACHE = new Map(); // key -> { headers, body, exp, size }（挿入順 = 古い順）
+let ASSET_BYTES = 0;
+
+function cacheDel(key) {
+  const e = ASSET_CACHE.get(key);
+  if (e) {
+    ASSET_BYTES -= e.size;
+    ASSET_CACHE.delete(key);
+  }
+}
+function cacheGet(key) {
+  const e = ASSET_CACHE.get(key);
+  if (!e) return null;
+  if (e.exp < Date.now()) {
+    cacheDel(key);
+    return null;
+  }
+  return e;
+}
+function cacheSet(key, headers, body) {
+  if (body.length > ASSET_ITEM_MAX) return;
+  cacheDel(key);
+  while (ASSET_BYTES + body.length > ASSET_MAX_BYTES && ASSET_CACHE.size) {
+    cacheDel(ASSET_CACHE.keys().next().value);
+  }
+  ASSET_CACHE.set(key, { headers, body, exp: Date.now() + ASSET_TTL, size: body.length });
+  ASSET_BYTES += body.length;
 }
 
 // ───────────────────────── SSRF対策（社内/ローカル宛を拒否） ─────────────────────────
@@ -228,6 +312,11 @@ function rewriteHtml(html, upstream, my) {
     return rewriteTag(tname, tattrs, base, my);
   });
 
+  // 言語は常に日本語（<html lang="ja">）
+  out = out.replace(/<html(\s[^>]*)?>/i, (m, a = "") =>
+    "<html" + a.replace(/\slang\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/i, "") + ' lang="ja">'
+  );
+
   // 断片(HTMLの一部だけ返すAPI)にはshimを入れない
   if (/<(html|head|body|!doctype)/i.test(out.slice(0, 4096))) {
     const shim = `<script src="/~shim.js?v=${SHIM_VER}"></script>`;
@@ -288,6 +377,7 @@ function buildUpstreamHeaders(req, upstream, myOrigin) {
     else if (v != null) h.set(k, v);
   }
   if (!h.has("user-agent")) h.set("user-agent", DEFAULT_UA);
+  h.set("accept-language", ACCEPT_LANG); // 言語は常に日本語
   const cookie = cookieFor(req, upstream.hostname);
   if (cookie) h.set("cookie", cookie);
   const ref = req.headers.referer ? realFromProxyUrl(req.headers.referer, myOrigin) : null;
@@ -312,6 +402,13 @@ function corsHeaders(req) {
   };
 }
 
+// Vary ヘッダに項目を追加する（既存の値は消さない）
+function appendVary(v, add) {
+  const list = String(v || "").split(",").map((s) => s.trim()).filter(Boolean);
+  if (!list.some((s) => s.toLowerCase() === add.toLowerCase())) list.push(add);
+  return list.join(", ");
+}
+
 // Location / PJAX系ヘッダをプロキシ用に書き換える
 function responseHeaders(r, req, upstream, myOrigin) {
   const h = {};
@@ -333,10 +430,8 @@ function responseHeaders(r, req, upstream, myOrigin) {
 
     h[k] = v;
   }
-  // CORSヘッダで上流の vary を消さないようにマージする
-  const upVary = h.vary;
   Object.assign(h, corsHeaders(req));
-  h.vary = upVary ? `${upVary}, Origin` : "Origin";
+  h.vary = appendVary(h.vary, "Origin");
 
   const sc = typeof r.headers.getSetCookie === "function" ? r.headers.getSetCookie() : [];
   const cookies = sc.map((c) => rewriteSetCookie(c, upstream.hostname, myOrigin.startsWith("https"))).filter(Boolean);
@@ -374,6 +469,16 @@ async function fetchUpstream(upstream, init, canRetry, res) {
   throw lastErr;
 }
 
+// 本文を全部読む（タイムアウト付き）
+async function readAll(r, ac) {
+  const timer = setTimeout(() => ac.abort(new Error("body timeout")), BODY_TIMEOUT);
+  try {
+    return Buffer.from(await r.arrayBuffer());
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function readBody(req) {
   if (req.method === "GET" || req.method === "HEAD") return undefined;
   const chunks = [];
@@ -384,6 +489,20 @@ async function readBody(req) {
     chunks.push(c);
   }
   return chunks.length ? Buffer.concat(chunks) : undefined;
+}
+
+// 本文をまとめて送る（gzip圧縮に対応）
+async function sendBuffer(req, res, status, hdrs, buf) {
+  const type = String(hdrs["content-type"] || "");
+  const ae = String(req.headers["accept-encoding"] || "");
+  if (/text|javascript|json|xml|svg/i.test(type) && buf.length > 1024 && /\bgzip\b/i.test(ae)) {
+    buf = await gzipAsync(buf);
+    hdrs["content-encoding"] = "gzip";
+    hdrs.vary = appendVary(hdrs.vary, "Accept-Encoding");
+  }
+  hdrs["content-length"] = buf.length;
+  res.writeHead(status, hdrs);
+  return res.end(req.method === "HEAD" ? undefined : buf);
 }
 
 // ───────────────────────── エラー表示（落ちずに必ず応答） ─────────────────────────
@@ -400,10 +519,10 @@ function sendError(req, res, err) {
     return res.end(req.method === "HEAD" ? undefined : `Proxy error ${status}: ${detail}`);
   }
   res.writeHead(status, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
-  res.end(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>中継エラー</title>
+  res.end(`<!doctype html><html lang="ja"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>中継エラー</title>
 <body style="font-family:system-ui,sans-serif;max-width:560px;margin:15vh auto;padding:0 20px;color:#222">
 <h2>ページを取得できませんでした (${status})</h2><p style="color:#666;word-break:break-all">${esc(detail)}</p>
-<button onclick="location.reload()" style="padding:10px 18px;font-size:16px">再読み込み</button></body>`);
+<button onclick="location.reload()" style="padding:10px 18px;font-size:16px">再読み込み</button></body></html>`);
 }
 
 // ───────────────────────── メイン処理 ─────────────────────────
@@ -437,9 +556,27 @@ async function handle(req, res) {
 
   const upstream = resolveUpstream(req, url, myOrigin);
 
+  // 計測・ログ系は上流に送らず 204
+  if (isTracker(upstream)) {
+    res.writeHead(204, corsHeaders(req));
+    return res.end();
+  }
+
   if (upstream.hostname.toLowerCase() === host.replace(/:\d+$/, "").toLowerCase() && !isSiteHost(upstream.hostname))
     throw httpErr(508, "Loop detected");
   await assertPublic(upstream.hostname);
+
+  // 静的ファイルはメモリキャッシュから返す（GETのみ・Rangeなし）
+  const cacheable = req.method === "GET" && !req.headers.range;
+  if (cacheable) {
+    const hit = cacheGet(upstream.href);
+    if (hit) {
+      const h = { ...hit.headers, ...corsHeaders(req) };
+      h.vary = appendVary(h.vary, "Origin");
+      h["x-cache"] = "HIT";
+      return sendBuffer(req, res, 200, h, hit.body);
+    }
+  }
 
   const body = await readBody(req);
   const headers = buildUpstreamHeaders(req, upstream, myOrigin);
@@ -471,6 +608,8 @@ async function handle(req, res) {
   const type = r.headers.get("content-type") || "";
   const isHtml = /^(text\/html|application\/xhtml\+xml)/i.test(type);
   const isCss = /^text\/css/i.test(type);
+  const isJson = /json/i.test(type);
+  const isStatic = STATIC_RE.test(type);
   const lenH = r.headers.get("content-length");
   const enc = r.headers.get("content-encoding");
   const noBody = req.method === "HEAD" || [204, 205, 304].includes(status) || !r.body;
@@ -484,27 +623,35 @@ async function handle(req, res) {
 
   // HTML / CSS は読み込んで書き換え
   if ((isHtml || isCss) && !(Number(lenH) > MAX_REWRITE_BYTES)) {
-    const timer = setTimeout(() => ac.abort(new Error("body timeout")), BODY_TIMEOUT);
-    let buf;
-    try {
-      buf = Buffer.from(await r.arrayBuffer());
-    } finally {
-      clearTimeout(timer);
-    }
+    const buf = await readAll(r, ac);
     const text = decode(buf, charsetOf(type, buf));
     const out = Buffer.from(isHtml ? rewriteHtml(text, upstream, myOrigin) : rewriteCss(text, upstream.href, myOrigin), "utf8");
     hdrs["content-type"] = (isHtml ? "text/html" : "text/css") + "; charset=utf-8";
-    hdrs["content-length"] = out.length;
     if (isHtml) {
       hdrs["cache-control"] = "no-store";
       delete hdrs.etag;
       delete hdrs["last-modified"];
     }
-    res.writeHead(status, hdrs);
-    return res.end(out);
+    return sendBuffer(req, res, status, hdrs, out);
   }
 
-  // それ以外（画像・動画・JS・JSON等）はストリーム転送（Range/206もそのまま）
+  // おすすめ一覧のJSON：日本の動画だけに絞る
+  if (isJson && status === 200 && req.method === "GET" && FEED_PATH_RE.test(upstream.pathname)) {
+    const buf = await readAll(r, ac);
+    const filtered = filterFeedJson(buf.toString("utf8"));
+    hdrs["cache-control"] = "no-store";
+    return sendBuffer(req, res, status, hdrs, filtered || buf);
+  }
+
+  // 静的ファイル：読み込んでキャッシュし、以後はメモリから返す
+  if (cacheable && isStatic && status === 200 && !hdrs["set-cookie"] && (!lenH || Number(lenH) <= ASSET_ITEM_MAX)) {
+    const buf = await readAll(r, ac);
+    hdrs["cache-control"] = "public, max-age=3600";
+    cacheSet(upstream.href, { ...hdrs }, buf);
+    return sendBuffer(req, res, status, hdrs, buf);
+  }
+
+  // それ以外（動画・大きいファイル等）はストリーム転送（Range/206もそのまま）
   if (lenH && !enc) hdrs["content-length"] = lenH;
   res.writeHead(status, hdrs);
   pipeline(Readable.fromWeb(r.body), res, () => {});
@@ -557,8 +704,9 @@ function makeShim() {
   return String.raw`(function(){
 "use strict";
 if(window.__pxShim)return;window.__pxShim=1;
-var O=location.origin,P=${JSON.stringify(P)},WSP=${JSON.stringify(WS)},T=${JSON.stringify(BASE.origin)},SITE=${JSON.stringify(SITE_HOST)};
+var O=location.origin,P=${JSON.stringify(P)},WSP=${JSON.stringify(WS)},T=${JSON.stringify(BASE.origin)},SITE=${JSON.stringify(SITE_HOST)},LANG=${JSON.stringify(LANG)};
 var ckey=${ckey.toString()};
+var TTH=/(^|\.)tiktok\.com$/i;
 function isSite(h){return String(h).toLowerCase()===SITE}
 function parseP(pn){
   if(pn.indexOf(P)!==0)return null;
@@ -569,6 +717,16 @@ function realBase(){
   try{var p=parseP(location.pathname);return p?new URL(p.origin+p.path+location.search):new URL(T+location.pathname+location.search)}
   catch(e){return new URL(T)}
 }
+
+// ── 言語は常に日本語
+try{
+  Object.defineProperty(Navigator.prototype,"language",{configurable:true,get:function(){return LANG}});
+  Object.defineProperty(Navigator.prototype,"languages",{configurable:true,get:function(){return [LANG,"ja"]}});
+}catch(e){}
+function setLang(){try{document.documentElement.setAttribute("lang","ja")}catch(e){}}
+setLang();
+document.addEventListener("DOMContentLoaded",setLang);
+
 var SKIP=/^(#|javascript:|mailto:|tel:|data:|blob:|about:|sms:|ws:|wss:)/i;
 // どんなURLでもProxy経由のURLへ（何度通しても結果は同じ）
 function prox(h){
@@ -585,6 +743,8 @@ function prox(h){
       var rb=realBase();
       u=new URL(rb.origin+u.pathname+u.search+u.hash);
     }
+    // 埋め込みプレイヤーは中継せず直接読む（速い）
+    if(TTH.test(u.hostname)&&u.pathname.indexOf("/embed/")===0)return u.href;
     // TARGET宛でも、今いるページが外部サイトなら /~p/ 形式で明示
     if(isSite(u.hostname)&&isSite(realBase().hostname))return O+u.pathname+u.search+u.hash;
     return O+P+u.protocol.slice(0,-1)+"/"+u.host+u.pathname+u.search+u.hash;
@@ -683,16 +843,16 @@ try{
 }catch(e){}
 
 // ── 再生オーバーレイ（TikTok の /video/ID, /@user/video/ID）
-// 動画ページを開くと、プレイヤーの位置に /embed/v2/ID（中継経由）を iframe で重ねて再生する
-var TTH=/(^|\.)tiktok\.com$/i;
+// プレイヤーの位置に TikTok 公式の埋め込みを iframe で重ねる（埋め込みは直接読む）
+var ttOv=null,ttDismissed="",ttTimer=0,ttQueued=false;
+var TTID=/^\/(?:@[^\/]+\/)?video\/(\d{6,})/;
 function ttId(ru){
   try{
     if(!TTH.test(ru.hostname))return null;
-    var m=/^\/(?:@[^\/]+\/)?video\/(\d{6,})/.exec(ru.pathname);
+    var m=TTID.exec(ru.pathname);
     return m?m[1]:null;
   }catch(e){return null}
 }
-var ttOv=null,ttTimer=0,ttDismissed="";
 var TT_SEL=['div[data-e2e="browse-video"]','div[data-e2e="video-player"]','div[class*="DivVideoContainer"]','div[class*="DivPlayerContainer"]','video'];
 function ttRect(){
   for(var i=0;i<TT_SEL.length;i++){
@@ -710,6 +870,17 @@ function ttPos(){
   if(r){s.left=r.left+"px";s.top=r.top+"px";s.width=r.width+"px";s.height=r.height+"px"}
   else{s.left="0px";s.top="0px";s.width=W+"px";s.height=H+"px"}
 }
+function ttPosSoon(){
+  if(ttQueued)return;
+  ttQueued=true;
+  requestAnimationFrame(function(){ttQueued=false;ttPos()});
+}
+// オーバーレイ中は、ネイティブ動画が再生を始めたら止める
+document.addEventListener("play",function(e){
+  try{if(ttOv&&e.target&&e.target.tagName==="VIDEO")e.target.pause()}catch(x){}
+},true);
+window.addEventListener("resize",ttPosSoon,{passive:true});
+window.addEventListener("scroll",ttPosSoon,{passive:true,capture:true});
 function ttUnmount(){
   if(ttTimer){clearInterval(ttTimer);ttTimer=0}
   if(ttOv){try{ttOv.parentNode&&ttOv.parentNode.removeChild(ttOv)}catch(e){}ttOv=null}
@@ -719,10 +890,10 @@ function ttMount(id){
   box.setAttribute("data-id",id);
   box.style.cssText="position:fixed;z-index:2147483600;background:#000;overflow:hidden;margin:0;padding:0";
   var f=document.createElement("iframe");
-  f.src=O+"/embed/v2/"+encodeURIComponent(id);
   f.setAttribute("allow","autoplay; fullscreen; encrypted-media; picture-in-picture; clipboard-write");
   f.setAttribute("allowfullscreen","");
   f.style.cssText="position:absolute;left:0;top:0;width:100%;height:100%;border:0;margin:0";
+  f.src="https://www.tiktok.com/embed/v2/"+encodeURIComponent(id);
   box.appendChild(f);
   var x=document.createElement("button");
   x.type="button";
@@ -735,20 +906,19 @@ function ttMount(id){
   ttOv=box;
   ttPos();
   ttPauseNative();
-  ttTimer=setInterval(function(){ttPos();ttPauseNative()},500);
 }
 function ttSync(){
   try{
     var id=ttId(realBase());
     if(!id){ttDismissed="";ttUnmount();return}
     if(id===ttDismissed){ttUnmount();return}
-    if(ttOv&&ttOv.getAttribute("data-id")===id){ttPos();return}
+    if(ttOv&&ttOv.getAttribute("data-id")===id){ttPos();ttPauseNative();return}
     ttUnmount();
     ttMount(id);
   }catch(e){}
 }
 window.addEventListener("popstate",function(){setTimeout(ttSync,0)});
-setInterval(ttSync,800);
+ttTimer=setInterval(ttSync,1000);
 if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",ttSync);else ttSync();
 
 // ── ServiceWorker: 自分のSWを登録し、サイト側のSW登録は無効化
